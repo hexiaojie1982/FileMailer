@@ -14,16 +14,23 @@
 """
 
 import os
+import sys
 import json
 from typing import List, Dict, Optional
 from cryptography.fernet import Fernet
 
 
-# 常量：配置文件和密钥文件的默认路径（与脚本同目录）
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 常量：配置文件和密钥文件的默认路径（与脚本或exe同目录）
+if getattr(sys, 'frozen', False):
+    # PyInstaller 打包后的运行环境，此时 sys.executable 的路径即为 .exe 所在目录
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # 正常 Python 源码运行环境
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ACCOUNTS_FILE = os.path.join(_BASE_DIR, "accounts.json")
 _SECRET_KEY_FILE = os.path.join(_BASE_DIR, ".secret.key")
 _SETTINGS_FILE = os.path.join(_BASE_DIR, "settings.json")
+_ACTIVE_TASK_FILE = os.path.join(_BASE_DIR, "active_task.json")
 
 # 预设的常见邮箱 SMTP 配置
 SMTP_PRESETS = {
@@ -248,3 +255,27 @@ def clear_settings() -> None:
     """清除普通设置"""
     if os.path.exists(_SETTINGS_FILE):
         os.remove(_SETTINGS_FILE)
+
+# ==========================================
+# 断点任务持久化 (Task Recovery)
+# ==========================================
+
+def load_active_task() -> Optional[Dict]:
+    """尝试加载上次未完成的崩溃/断点任务记录"""
+    if not os.path.exists(_ACTIVE_TASK_FILE):
+        return None
+    try:
+        with open(_ACTIVE_TASK_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return None
+
+def save_active_task(task_data: Dict) -> None:
+    """覆盖保存当前的发送任务状态"""
+    with open(_ACTIVE_TASK_FILE, 'w', encoding='utf-8') as f:
+        json.dump(task_data, f, ensure_ascii=False, indent=2)
+
+def clear_active_task() -> None:
+    """清除当前活动任务（任务100%发完或被用户主动废弃时调用）"""
+    if os.path.exists(_ACTIVE_TASK_FILE):
+        os.remove(_ACTIVE_TASK_FILE)

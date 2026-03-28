@@ -286,6 +286,125 @@ class FileMailerApp:
         self._build_ui()
         self._refresh_accounts()
         self._load_settings()
+        self.root.after(500, self._check_active_task)
+
+    def _check_active_task(self):
+        """检查是否有断点任务"""
+        task = config_manager.load_active_task()
+        if not task:
+            return
+            
+        temp_dir = task.get("temp_dir", "")
+        if not temp_dir or not os.path.exists(temp_dir):
+            config_manager.clear_active_task()
+            return
+            
+        sent = len(task.get("sent_indices", []))
+        total = len(task.get("volume_paths", []))
+        if sent >= total:
+            config_manager.clear_active_task()
+            return
+            
+        msg = f"检测到上次有未完成的发送任务 ({sent}/{total})。\n标题: {task.get('subject_prefix')}\n\n是否使用当前界面选中的账号继续发送剩下文件？\n(点“否”将放弃并清理该任务记录)"
+        if messagebox.askyesno("断点续传", msg, parent=self.root):
+            self._start_resume_task(task)
+        else:
+            config_manager.clear_active_task()
+
+    def _start_resume_task(self, task_data):
+        """开始执行续传任务"""
+        if self._running:
+            return
+        if not self.account_var.get():
+            messagebox.showwarning("提示", "请先在上方配置并选择发件账号")
+            return
+            
+        self._save_settings()
+        self._running = True
+        self._cancel_flag = False
+        self.start_btn.config(state=DISABLED)
+        self.cancel_btn.config(state=NORMAL)
+        self.progress_var.set(0)
+        
+        self.log_text.config(state=NORMAL)
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state=DISABLED)
+        
+        thread = threading.Thread(target=self._run_resume_task, args=(task_data,), daemon=True)
+        thread.start()
+
+    def _run_resume_task(self, task_data):
+        """执行断点续传子线程"""
+        try:
+            accounts = config_manager.load_accounts()
+            selected_index = self.account_combo.current()
+            if selected_index < 0:
+                self._log("❌ 错误：未找到选中的发件账号")
+                return
+
+            account = accounts[selected_index]
+            from_addr = account['email']
+            smtp_config = {
+                'smtp_server': account['smtp_server'],
+                'smtp_port': account['smtp_port'],
+                'password': account['password'],
+                'use_ssl': account['use_ssl']
+            }
+
+            interval = self.interval_var.get()
+            temp_dir = task_data["temp_dir"]
+            subject_prefix = task_data["subject_prefix"]
+            volume_paths = task_data["volume_paths"]
+            recipients = task_data["recipients"]
+            
+            # 使用界面刚设置的重试参数
+            max_retries = self.max_retries_var.get()
+            retry_wait = self.retry_wait_var.get()
+
+            self._log(f"🔄 启动断点续传任务...")
+            self._log(f"   发件人: {from_addr}")
+            self._log(f"   收件人: {', '.join(recipients)}")
+            self._update_progress(50)
+
+            def send_progress(msg, current, total):
+                self._log(f"  {msg}")
+                pct = 50 + (current / total) * 50
+                self._update_progress(pct)
+
+            def volume_sent_cb(index: int, path: str):
+                if index not in task_data["sent_indices"]:
+                    task_data["sent_indices"].append(index)
+                config_manager.save_active_task(task_data)
+
+            mailer.send_volumes(
+                smtp_config=smtp_config,
+                from_addr=from_addr,
+                to_addrs=recipients,
+                subject_prefix=subject_prefix,
+                volume_paths=volume_paths,
+                interval_seconds=interval,
+                max_retries=max_retries,
+                retry_wait=retry_wait,
+                sent_indices=task_data.get("sent_indices", []),
+                progress_callback=send_progress,
+                cancel_flag=lambda: self._cancel_flag,
+                volume_sent_callback=volume_sent_cb
+            )
+
+            if not self._cancel_flag:
+                self._update_progress(100)
+                self._log("\n🎉 断点续传全部完成！")
+                config_manager.clear_active_task()
+                self.root.after(0, lambda: self._ask_cleanup(temp_dir))
+
+        except Exception as e:
+            self._log(f"\n❌ 发生错误: {str(e)}")
+            import traceback
+            self._log(traceback.format_exc())
+        finally:
+            self._running = False
+            self.root.after(0, lambda: self.start_btn.config(state=NORMAL))
+            self.root.after(0, lambda: self.cancel_btn.config(state=DISABLED))
 
     def _build_ui(self):
         """构建完整的 GUI 界面"""
@@ -457,16 +576,32 @@ class FileMailerApp:
             side=LEFT, fill=X, expand=True, padx=5
         )
 
-        # 发送间隔
+        # 发送间隔与重试设置
         interval_row = ttk.Frame(frame)
         interval_row.pack(fill=X, padx=10, pady=(2, 10))
         ttk.Label(interval_row, text="发送间隔:", width=12).pack(side=LEFT)
         self.interval_var = ttk.IntVar(value=30)
         ttk.Spinbox(
             interval_row, textvariable=self.interval_var,
-            from_=5, to=300, increment=5, width=8
+            from_=5, to=300, increment=5, width=5
         ).pack(side=LEFT, padx=5)
-        ttk.Label(interval_row, text="秒（每封邮件之间的等待时间）").pack(side=LEFT)
+        ttk.Label(interval_row, text="秒").pack(side=LEFT, padx=(0, 15))
+
+        ttk.Label(interval_row, text="失败重试:").pack(side=LEFT)
+        self.max_retries_var = ttk.IntVar(value=10)
+        ttk.Spinbox(
+            interval_row, textvariable=self.max_retries_var,
+            from_=0, to=999, increment=1, width=3
+        ).pack(side=LEFT, padx=5)
+        ttk.Label(interval_row, text="次").pack(side=LEFT, padx=(0, 15))
+
+        ttk.Label(interval_row, text="重试等待:").pack(side=LEFT)
+        self.retry_wait_var = ttk.IntVar(value=15)
+        ttk.Spinbox(
+            interval_row, textvariable=self.retry_wait_var,
+            from_=5, to=300, increment=5, width=4
+        ).pack(side=LEFT, padx=5)
+        ttk.Label(interval_row, text="秒").pack(side=LEFT)
 
     def _build_action_section(self, parent):
         """构建操作区域（按钮 + 进度条 + 日志）"""
@@ -623,9 +758,12 @@ class FileMailerApp:
         if "volume_size" in settings:
             self.volume_var.set(settings["volume_size"])
             
-        # 恢复发件间隔
         if "interval" in settings:
             self.interval_var.set(settings["interval"])
+        if "max_retries" in settings:
+            self.max_retries_var.set(settings["max_retries"])
+        if "retry_wait" in settings:
+            self.retry_wait_var.set(settings["retry_wait"])
             
         # 恢复上次选中的发件账号
         last_account = settings.get("last_account", "")
@@ -654,6 +792,8 @@ class FileMailerApp:
             "compress_pwd": self.compress_pwd_var.get(),
             "volume_size": self.volume_var.get(),
             "interval": self.interval_var.get(),
+            "max_retries": self.max_retries_var.get(),
+            "retry_wait": self.retry_wait_var.get(),
             "last_account": self.account_var.get(),
             "last_recipients": self.recipients,
             "recipient_history": history[-20:]  # 最多存20个历史
@@ -669,6 +809,8 @@ class FileMailerApp:
             self.compress_pwd_var.set("")
             self.volume_var.set("10")
             self.interval_var.set("30")
+            self.max_retries_var.set(10)
+            self.retry_wait_var.set(15)
             self.recipients.clear()
             self._refresh_recipient_list()
             self.recipient_combo['values'] = []
@@ -822,7 +964,16 @@ class FileMailerApp:
                 self._log("⚠️ 已取消。")
                 return
 
-            # ---- 第三步：逐一发送 ----
+            # 在发信前建立断点任务快照
+            task_data = {
+                "temp_dir": temp_dir,
+                "subject_prefix": subject_prefix,
+                "volume_paths": volume_paths,
+                "recipients": self.recipients,
+                "sent_indices": []
+            }
+            config_manager.save_active_task(task_data)
+
             self._log(f"\n📧 开始发送邮件...")
             self._log(f"   发件人: {from_addr}")
             self._log(f"   收件人: {', '.join(self.recipients)}")
@@ -834,6 +985,10 @@ class FileMailerApp:
                 pct = 50 + (current / total) * 50  # 发送占 50%-100%
                 self._update_progress(pct)
 
+            def volume_sent_cb(index: int, path: str):
+                task_data["sent_indices"].append(index)
+                config_manager.save_active_task(task_data)
+
             mailer.send_volumes(
                 smtp_config=smtp_config,
                 from_addr=from_addr,
@@ -841,13 +996,18 @@ class FileMailerApp:
                 subject_prefix=subject_prefix,
                 volume_paths=volume_paths,
                 interval_seconds=interval,
+                max_retries=self.max_retries_var.get(),
+                retry_wait=self.retry_wait_var.get(),
+                sent_indices=[],
                 progress_callback=send_progress,
-                cancel_flag=lambda: self._cancel_flag
+                cancel_flag=lambda: self._cancel_flag,
+                volume_sent_callback=volume_sent_cb
             )
 
             if not self._cancel_flag:
                 self._update_progress(100)
                 self._log("\n🎉 全部完成！所有分卷文件已发送。")
+                config_manager.clear_active_task()
 
                 # 提示用户是否清理临时文件
                 self.root.after(0, lambda: self._ask_cleanup(temp_dir))

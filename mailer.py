@@ -123,8 +123,12 @@ def send_volumes(
     subject_prefix: str,
     volume_paths: List[str],
     interval_seconds: int = 30,
+    max_retries: int = 10,
+    retry_wait: int = 15,
+    sent_indices: Optional[List[int]] = None,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
-    cancel_flag: Optional[Callable[[], bool]] = None
+    cancel_flag: Optional[Callable[[], bool]] = None,
+    volume_sent_callback: Optional[Callable[[int, str], None]] = None
 ) -> None:
     """
     逐一发送分卷压缩文件，每封邮件间隔指定时间。
@@ -136,8 +140,12 @@ def send_volumes(
         subject_prefix: 邮件主题前缀（自动追加 [1/N] 等编号）
         volume_paths: 分卷文件路径列表（按顺序）
         interval_seconds: 每封邮件之间的间隔（秒）
+        max_retries: 网络故障最大重传次数
+        retry_wait: 重连等待间隔（秒）
+        sent_indices: 已经成功发送的分卷索引列表（用于断点续传跳过）
         progress_callback: 进度回调 (状态文本, 当前编号, 总数)
         cancel_flag: 取消标志函数，返回 True 时中止发送
+        volume_sent_callback: 单个分卷发送成功后的回调 (索引, 文件路径)
 
     Raises:
         Exception: 发送过程中的任何错误
@@ -145,6 +153,12 @@ def send_volumes(
     total = len(volume_paths)
 
     for i, vol_path in enumerate(volume_paths, start=1):
+        # 如果这是个断点续传任务且此卷之前已发过，则直接跳过
+        if sent_indices and i in sent_indices:
+            if progress_callback:
+                progress_callback(f"⏭️ 续传跳过已发分卷: [{i}/{total}]", i, total)
+            continue
+
         # 检查是否取消
         if cancel_flag and cancel_flag():
             if progress_callback:
@@ -176,14 +190,43 @@ def send_volumes(
         if progress_callback:
             progress_callback(f"正在发送 [{i}/{total}]: {zip_file_name}", i, total)
 
-        # 发送套了 zip 壳的邮件
-        send_email(smtp_config, from_addr, to_addrs, subject, body, zip_path, zip_file_name)
+        # 发送套了 zip 壳的邮件（带智能重试防断机制）
+        attempt = 0
+        while True:
+            try:
+                send_email(smtp_config, from_addr, to_addrs, subject, body, zip_path, zip_file_name)
+                break  # 成功，跳出重试
+            except Exception as e:
+                # 区分永久性错误和临时网络错误
+                if isinstance(e, (smtplib.SMTPAuthenticationError, smtplib.SMTPDataError)):
+                    # 密码错误或安全策略阻断，重试无用，直接向上抛出
+                    raise e
+                    
+                attempt += 1
+                if attempt > max_retries:
+                    # 超过最大重试次数，宣告彻底失败
+                    raise e
+                
+                if progress_callback:
+                    progress_callback(f"⚠️ [网络重试 {attempt}/{max_retries}] 等待 {retry_wait}s 重连...", i, total)
+                
+                # 延时避让，并允许在此期间依然能秒切取消动作
+                for _ in range(retry_wait):
+                    if cancel_flag and cancel_flag():
+                        if progress_callback:
+                            progress_callback("已取消发送（重连中）。", i, total)
+                        return
+                    time.sleep(1)
         
         # 发送完毕后删除临时的 zip 文件节省空间
         try:
             os.remove(zip_path)
         except Exception:
             pass
+
+        # 触发单卷完成回调（用于外层断点存盘记录）
+        if volume_sent_callback:
+            volume_sent_callback(i, vol_path)
 
         if progress_callback:
             progress_callback(f"已发送 [{i}/{total}]: {file_name}", i, total)
