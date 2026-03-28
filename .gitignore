@@ -1,0 +1,15 @@
+# 编译与构建生成的目录 (PyInstaller)
+/build/
+/dist/
+/*.spec
+
+# 个人隐私数据配置 (绝对不能上传)
+accounts.json
+settings.json
+.secret.key
+
+# Python 无用缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
