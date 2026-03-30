@@ -17,11 +17,34 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app import FileMailerApp
 
+import argparse
 
 def main():
     """程序入口"""
-    app = FileMailerApp()
-    app.run()
+    parser = argparse.ArgumentParser(description="文件分卷压缩 & 邮件自动发送工具")
+    parser.add_argument("--cli", action="store_true", help="启用无界面的命令行静默模式")
+    parser.add_argument("--files", nargs='+', help="需要打包发送的文件或目录路径。如: --files path1 path2")
+    parser.add_argument("--to-addrs", help="收件人邮箱，多个以逗号隔开")
+    parser.add_argument("--account", help="使用的发件账号名称或邮箱（需在界面提前配置过）")
+    parser.add_argument("--subject", default="", help="(可选) 邮件主题前缀")
+    parser.add_argument("--volume", type=int, default=10, help="(可选) 压缩分卷大小(MB)，默认 10")
+    parser.add_argument("--password", default=None, help="(可选) 解压密码")
+    parser.add_argument("--interval", type=int, default=30, help="(可选) 发送间隔(秒)，默认 30")
+    parser.add_argument("--max-retries", type=int, default=10, help="(可选) 单包断网最高重连次数，默认 10")
+    parser.add_argument("--retry-wait", type=int, default=15, help="(可选) 重连时的避让耗时(秒)，默认 15")
+    parser.add_argument("--prompt-timeout", type=int, default=30, help="(可选) 失败时留给用户选择 Y/N 的倒计时(秒)，默认 30。倒计时完自动销毁临时记录并退出。")
+    parser.add_argument("--resume", action="store_true", help="(高级) 高优级启动，跨过打包环节提取上次中断留下的快照直接向收信端补发尾盘")
+
+    # 仅提取已知参数防止在 GUI 运行双击时带有其他传参引发报错
+    args, unknown = parser.parse_known_args()
+
+    if args.cli:
+        import cli_runner
+        cli_runner.run_cli(args)
+    else:
+        # 进入常规 GUI 面板
+        app = FileMailerApp()
+        app.run()
 
 
 if __name__ == "__main__":
