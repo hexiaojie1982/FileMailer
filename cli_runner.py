@@ -62,10 +62,17 @@ def get_account_config(account_identifier: str) -> dict:
             }
     return {}
 
-def console_progress(msg: str, current: int, total: int):
-    """纯命令行环境下的日志/进度条"""
+def console_compress_progress(msg: str, progress: float):
+    """用于压缩环节的纯文本进度反馈"""
+    if progress >= 0:
+        print(f"[打包进度 {progress:.1f}%] {msg}")
+    else:
+        print(f"[打包中...] {msg}")
+
+def console_send_progress(msg: str, current: int, total: int):
+    """用于发信环节的纯文本进度反馈"""
     if total > 0:
-        print(f"[{current}/{total}] {msg}")
+        print(f"[发信 {current}/{total}] {msg}")
     else:
         print(msg)
 
@@ -124,7 +131,7 @@ def run_cli(args: argparse.Namespace):
             archive_name=archive_name,
             password=args.password,
             volume_size_mb=args.volume,
-            progress_callback=console_progress
+            progress_callback=console_compress_progress
         )
         print(f"✅ 压缩完成，共切分成 {len(volume_paths)} 份分卷。")
         
@@ -169,7 +176,7 @@ def run_cli(args: argparse.Namespace):
                 max_retries=args.max_retries,
                 retry_wait=args.retry_wait,
                 sent_indices=task_data["sent_indices"],
-                progress_callback=console_progress,
+                progress_callback=console_send_progress,
                 cancel_flag=None, # CLI 不接收手动终止快捷键阻断
                 volume_sent_callback=volume_sent_cb
             )
