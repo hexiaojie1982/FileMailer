@@ -26,12 +26,12 @@ def timed_input(prompt: str, timeout: int, default: str) -> str:
             if remaining < 0:
                 print(f"\n[超时自动执行] -> {default}")
                 return default
-                
+            
             if remaining != last_sec:
                 # 刷新同行文字
                 print(f"\r{prompt} (将在 {remaining} 秒后默认执行 '{default}') ", end='', flush=True)
                 last_sec = remaining
-                
+            
             if msvcrt.kbhit():
                 char = msvcrt.getch()
                 try:
@@ -94,7 +94,7 @@ def run_cli(args: argparse.Namespace):
             print("❌ 错误: 先前任务的临时文件目录已丢失。无法断点重连。")
             config_manager.clear_active_task()
             sys.exit(1)
-            
+        
         print("✅ 检测到之前中断的任务！启用短连接跳过压缩环节。")
         task_data = active_task
     else:
@@ -210,3 +210,22 @@ def run_cli(args: argparse.Namespace):
             
     print("👋 CLI 运行终止。")
     sys.exit(0)
+
+def main():
+    parser = argparse.ArgumentParser(description='FileMailer CLI - 分卷压缩邮件发送工具')
+    parser.add_argument('--files', nargs='+', help='要发送的文件路径')
+    parser.add_argument('--to-addrs', type=str, help='收件人邮箱，多个用逗号分隔')
+    parser.add_argument('--account', type=str, required=True, help='发件人账号名称')
+    parser.add_argument('--volume', type=int, default=20, help='分卷大小(MB)，默认20')
+    parser.add_argument('--password', type=str, default='', help='压缩包密码')
+    parser.add_argument('--interval', type=int, default=60, help='发送间隔(秒)，默认60')
+    parser.add_argument('--max-retries', type=int, default=3, help='最大重试次数，默认3')
+    parser.add_argument('--retry-wait', type=int, default=15, help='重试等待(秒)，默认15')
+    parser.add_argument('--prompt-timeout', type=int, default=5, help='用户提示超时(秒)，默认5')
+    parser.add_argument('--subject', type=str, default='', help='邮件主题前缀')
+    parser.add_argument('--resume', action='store_true', help='断点续传')
+    args = parser.parse_args()
+    run_cli(args)
+
+if __name__ == "__main__":
+    main()
