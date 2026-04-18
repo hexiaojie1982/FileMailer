@@ -117,43 +117,72 @@ def send_email(
 
 
 def send_volumes(
-    smtp_config: Dict,
-    from_addr: str,
+    sender_accounts: List[Dict],
     to_addrs: List[str],
     subject_prefix: str,
     volume_paths: List[str],
     interval_seconds: int = 30,
+    send_limit_per_account: int = 0,
     max_retries: int = 10,
     retry_wait: int = 15,
     sent_indices: Optional[List[int]] = None,
+    start_account_index: int = 0,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
     cancel_flag: Optional[Callable[[], bool]] = None,
-    volume_sent_callback: Optional[Callable[[int, str], None]] = None
+    volume_sent_callback: Optional[Callable[[int, str], None]] = None,
+    account_switch_callback: Optional[Callable[[int, str], None]] = None
 ) -> None:
     """
-    逐一发送分卷压缩文件，每封邮件间隔指定时间。
+    逐一发送分卷压缩文件，支持多账号轮询与自动切换。
 
     Args:
-        smtp_config: SMTP 配置字典
-        from_addr: 发件人邮箱地址
+        sender_accounts: 发件账号配置列表，每项为 dict:
+            {'smtp_config': {...}, 'from_addr': '...'}
         to_addrs: 收件人邮箱地址列表
         subject_prefix: 邮件主题前缀（自动追加 [1/N] 等编号）
         volume_paths: 分卷文件路径列表（按顺序）
         interval_seconds: 每封邮件之间的间隔（秒）
+        send_limit_per_account: 每个账号最大发件数，0 = 不限制
         max_retries: 网络故障最大重传次数
         retry_wait: 重连等待间隔（秒）
         sent_indices: 已经成功发送的分卷索引列表（用于断点续传跳过）
+        start_account_index: 起始账号索引（用于断点续传时跳过前面的账号）
         progress_callback: 进度回调 (状态文本, 当前编号, 总数)
         cancel_flag: 取消标志函数，返回 True 时中止发送
         volume_sent_callback: 单个分卷发送成功后的回调 (索引, 文件路径)
+        account_switch_callback: 账号切换时的回调 (新索引, 新邮箱地址)
 
     Raises:
-        Exception: 发送过程中的任何错误
+        Exception: 所有账号均无法完成发送时抛出
     """
     total = len(volume_paths)
+    num_accounts = len(sender_accounts)
+
+    # 当前账号指针与该账号已发送计数
+    cur_acc_idx = start_account_index % num_accounts
+    cur_acc_sent = 0
+
+    def _get_current():
+        """获取当前账号的 smtp_config 和 from_addr"""
+        acc = sender_accounts[cur_acc_idx]
+        return acc['smtp_config'], acc['from_addr']
+
+    def _switch_account(reason: str):
+        """切换到下一个账号，返回是否成功（循环一圈则失败）"""
+        nonlocal cur_acc_idx, cur_acc_sent
+        old_idx = cur_acc_idx
+        cur_acc_idx = (cur_acc_idx + 1) % num_accounts
+        cur_acc_sent = 0
+        new_addr = sender_accounts[cur_acc_idx]['from_addr']
+        if account_switch_callback:
+            account_switch_callback(cur_acc_idx, new_addr)
+        if progress_callback:
+            progress_callback(f"🔄 {reason}，切换发件账号 → {new_addr}", 0, total)
+        # 返回是否已经绕了一整圈（无可用账号）
+        return cur_acc_idx != old_idx or num_accounts == 1
 
     for i, vol_path in enumerate(volume_paths, start=1):
-        # 如果这是个断点续传任务且此卷之前已发过，则直接跳过
+        # 断点续传跳过已发分卷
         if sent_indices and i in sent_indices:
             if progress_callback:
                 progress_callback(f"⏭️ 续传跳过已发分卷: [{i}/{total}]", i, total)
@@ -165,16 +194,18 @@ def send_volumes(
                 progress_callback("已取消发送。", i, total)
             return
 
-        # 方案：将 7z 分卷套一层标准的 zip 压缩包来发送。
-        # 很多严格的邮箱（如 Gmail）通过读取二进制头直接阻断 .7z.001 等分卷或带密压缩包，
-        # 套一层 zip 通常能骗过扫描器，且接收方可以用系统自带功能直接解压出 .001 文件。
+        # 检查当前账号是否达到发件上限（send_limit > 0 时生效）
+        if send_limit_per_account > 0 and cur_acc_sent >= send_limit_per_account:
+            _switch_account(f"账号已达发件上限 ({send_limit_per_account}封)")
+
+        # 准备 zip 封装
         file_name = os.path.basename(vol_path)
         zip_path = f"{vol_path}.zip"
         zip_file_name = f"{file_name}.zip"
-        
+
         if progress_callback:
             progress_callback(f"正在进行 zip 封装防拦截: {zip_file_name}", i, total)
-            
+
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.write(vol_path, arcname=file_name)
 
@@ -187,44 +218,64 @@ def send_volumes(
             f"请将所有解压出来的分卷（.001, .002...）放于同一文件夹内，最后使用 7-Zip 打开 .001 即可完整解压全部文件。"
         )
 
-        if progress_callback:
-            progress_callback(f"正在发送 [{i}/{total}]: {zip_file_name}", i, total)
+        smtp_config, from_addr = _get_current()
 
-        # 发送套了 zip 壳的邮件（带智能重试防断机制）
+        if progress_callback:
+            progress_callback(f"正在发送 [{i}/{total}] (账号: {from_addr}): {zip_file_name}", i, total)
+
+        # 带智能重试与账号自动切换的发送逻辑
         attempt = 0
+        tried_accounts = 0  # 已尝试过的账号数（用于判定全部耗尽）
         while True:
             try:
                 send_email(smtp_config, from_addr, to_addrs, subject, body, zip_path, zip_file_name)
-                break  # 成功，跳出重试
+                break  # 成功
             except Exception as e:
-                # 区分永久性错误和临时网络错误
+                # 认证错误或数据策略错误 → 该账号不可用，直接切换
                 if isinstance(e, (smtplib.SMTPAuthenticationError, smtplib.SMTPDataError)):
-                    # 密码错误或安全策略阻断，重试无用，直接向上抛出
-                    raise e
-                    
+                    tried_accounts += 1
+                    if tried_accounts >= num_accounts:
+                        raise e  # 所有账号都不可用
+                    if progress_callback:
+                        progress_callback(f"⛔ 账号 {from_addr} 认证/策略错误: {e}", i, total)
+                    _switch_account("账号认证失败")
+                    smtp_config, from_addr = _get_current()
+                    attempt = 0
+                    continue
+
+                # 网络类临时错误 → 重试
                 attempt += 1
                 if attempt > max_retries:
-                    # 超过最大重试次数，宣告彻底失败
-                    raise e
-                
+                    # 当前账号重试耗尽，切换下一个账号
+                    tried_accounts += 1
+                    if tried_accounts >= num_accounts:
+                        raise e  # 所有账号均重试耗尽
+                    _switch_account(f"重试 {max_retries} 次仍失败")
+                    smtp_config, from_addr = _get_current()
+                    attempt = 0
+                    continue
+
                 if progress_callback:
                     progress_callback(f"⚠️ [网络重试 {attempt}/{max_retries}] 等待 {retry_wait}s 重连...", i, total)
-                
-                # 延时避让，并允许在此期间依然能秒切取消动作
+
+                # 延时避让，可被取消中断
                 for _ in range(retry_wait):
                     if cancel_flag and cancel_flag():
                         if progress_callback:
                             progress_callback("已取消发送（重连中）。", i, total)
                         return
                     time.sleep(1)
-        
-        # 发送完毕后删除临时的 zip 文件节省空间
+
+        # 发送完毕后删除临时 zip
         try:
             os.remove(zip_path)
         except Exception:
             pass
 
-        # 触发单卷完成回调（用于外层断点存盘记录）
+        # 更新当前账号已发计数
+        cur_acc_sent += 1
+
+        # 触发单卷完成回调（断点存盘）
         if volume_sent_callback:
             volume_sent_callback(i, vol_path)
 
@@ -238,7 +289,6 @@ def send_volumes(
                     f"等待 {interval_seconds} 秒后发送下一封...",
                     i, total
                 )
-            # 分段等待，以便检查取消标志
             for _ in range(interval_seconds):
                 if cancel_flag and cancel_flag():
                     if progress_callback:

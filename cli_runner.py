@@ -48,19 +48,29 @@ def timed_input(prompt: str, timeout: int, default: str) -> str:
             return default
         return 'Y' if 'y' in ans.lower() else 'N'
 
-def get_account_config(account_identifier: str) -> dict:
-    """根据别名或邮箱在一堆账号中找到对应的 SMTP 配置"""
+def build_sender_accounts(account_identifiers: str) -> list:
+    """根据逗号分隔的账号标识列表，构建 sender_accounts 列表"""
     accounts = config_manager.load_accounts()
-    for acc in accounts:
-        if acc['name'] == account_identifier or acc['email'] == account_identifier:
-            return {
-                'smtp_server': acc['smtp_server'],
-                'smtp_port': acc['smtp_port'],
-                'password': acc['password'], # mailer 会自动解密
-                'use_ssl': acc['use_ssl'],
-                'from_addr': acc['email']
-            }
-    return {}
+    result = []
+    for ident in account_identifiers.split(','):
+        ident = ident.strip()
+        if not ident:
+            continue
+        for acc in accounts:
+            if acc['name'] == ident or acc['email'] == ident:
+                result.append({
+                    'smtp_config': {
+                        'smtp_server': acc['smtp_server'],
+                        'smtp_port': acc['smtp_port'],
+                        'password': acc['password'],
+                        'use_ssl': acc['use_ssl']
+                    },
+                    'from_addr': acc['email']
+                })
+                break
+        else:
+            print(f"⚠️ 未找到账号 '{ident}'，已跳过。")
+    return result
 
 def console_compress_progress(msg: str, progress: float):
     """用于压缩环节的纯文本进度反馈"""
@@ -86,34 +96,33 @@ def run_cli(args: argparse.Namespace):
     task_data = None
     if args.resume:
         if not active_task:
-            print("❌ 错误: 未发现任何被中断的未完成任务快照。请勿使用 --resume 参数，传路径以开启新任务。")
+            print("❌ 错误: 未发现任何被中断的未完成任务快照。")
             sys.exit(1)
         
         temp_dir = active_task.get("temp_dir", "")
         if not temp_dir or not os.path.exists(temp_dir):
-            print("❌ 错误: 先前任务的临时文件目录已丢失。无法断点重连。")
+            print("❌ 错误: 先前任务的临时文件目录已丢失。")
             config_manager.clear_active_task()
             sys.exit(1)
         
-        print("✅ 检测到之前中断的任务！启用短连接跳过压缩环节。")
+        print("✅ 检测到之前中断的任务，跳过压缩环节。")
         task_data = active_task
     else:
-        # 新任务参数校验
         if not args.files:
-            print("❌ 参数丢失: 当你不使用 --resume 续传时，需通过 --files 指定所需的文件路径。")
+            print("❌ 参数缺失: 需通过 --files 指定文件路径。")
             sys.exit(1)
         if not args.to_addrs:
-            print("❌ 参数丢失: 必须通过 --to 指定至少一位收件人邮箱，多可用逗号隔开。")
+            print("❌ 参数缺失: 需通过 --to-addrs 指定收件人邮箱。")
             sys.exit(1)
 
-    # 2. 账号合法性校验
-    account_config = get_account_config(args.account)
-    if not account_config:
-        print(f"❌ 查无此发件人账号快照: '{args.account}'。请确保您已在 GUI 下添加并成功保存过该账号的名字或邮箱！")
+    # 2. 构建多账号发件池
+    sender_accounts = build_sender_accounts(args.account)
+    if not sender_accounts:
+        print(f"❌ 未找到任何有效的发件账号。请确保已在 GUI 中配置过对应账号。")
         sys.exit(1)
     
-    from_addr = account_config.pop('from_addr')
     to_addrs = [addr.strip() for addr in args.to_addrs.split(',')] if getattr(args, 'to_addrs', None) else task_data['recipients']
+    send_limit = getattr(args, 'send_limit', 0)
 
     # 如果是新任务，先走压缩流程
     if not task_data:
@@ -122,7 +131,7 @@ def run_cli(args: argparse.Namespace):
         archive_name = os.path.splitext(base_name)[0] if os.path.isfile(first_path) else base_name
         subject_prefix = args.subject if args.subject else archive_name
         
-        print("\n⚙️ 阶段 1：正在对指定资源进行压模分卷打包...")
+        print("\n⚙️ 阶段 1：正在压缩分卷...")
         temp_dir = tempfile.mkdtemp(prefix="file_mailer_cli_")
         
         volume_paths = compressor.compress_and_split(
@@ -133,9 +142,8 @@ def run_cli(args: argparse.Namespace):
             volume_size_mb=args.volume,
             progress_callback=console_compress_progress
         )
-        print(f"✅ 压缩完成，共切分成 {len(volume_paths)} 份分卷。")
+        print(f"✅ 压缩完成，共 {len(volume_paths)} 份分卷。")
         
-        # 立刻写入数据库快照图，备日后断连之需
         task_data = {
             "temp_dir": temp_dir,
             "subject_prefix": subject_prefix,
@@ -145,48 +153,54 @@ def run_cli(args: argparse.Namespace):
         }
         config_manager.save_active_task(task_data)
 
-    # 进入发信死亡循环 (能被 Y/N 交互掌控)
+    # 发信主循环
     while True:
         sent_indices = task_data.get("sent_indices", [])
         total = len(task_data["volume_paths"])
         if len(sent_indices) >= total:
-            print(f"\n🎉 恭喜！{total} 件分卷早已全部派发完毕，无需多此一举。")
+            print(f"\n🎉 全部 {total} 份分卷已发送完毕。")
             break
 
-        print("\n📧 阶段 2：启动 SMTP 分页集群派送...")
-        print(f"   [发 件 人] -> {from_addr}")
-        print(f"   [发 送 至] -> {', '.join(to_addrs)}")
-        print(f"   [进度跳过] -> {'、'.join(map(str, sent_indices))} 号分卷 (历史已补)")
+        addrs = [a['from_addr'] for a in sender_accounts]
+        print(f"\n📧 阶段 2：启动 SMTP 发送...")
+        print(f"   发件账号池: {', '.join(addrs)}")
+        print(f"   收件人: {', '.join(to_addrs)}")
+        if send_limit > 0:
+            print(f"   每账号上限: {send_limit} 封")
+        print(f"   已发送: {len(sent_indices)}/{total}")
         print("-" * 60)
 
-        # 回调勾子：存活并更新数据库快照
         def volume_sent_cb(index: int, path: str):
             if index not in task_data["sent_indices"]:
                 task_data["sent_indices"].append(index)
             config_manager.save_active_task(task_data)
+
+        def on_account_switch(new_idx: int, new_addr: str):
+            print(f"📌 已切换到发件账号: {new_addr}")
         
         try:
             mailer.send_volumes(
-                smtp_config=account_config,
-                from_addr=from_addr,
+                sender_accounts=sender_accounts,
                 to_addrs=task_data["recipients"],
                 subject_prefix=task_data["subject_prefix"],
                 volume_paths=task_data["volume_paths"],
                 interval_seconds=args.interval,
+                send_limit_per_account=send_limit,
                 max_retries=args.max_retries,
                 retry_wait=args.retry_wait,
                 sent_indices=task_data["sent_indices"],
                 progress_callback=console_send_progress,
-                cancel_flag=None, # CLI 不接收手动终止快捷键阻断
-                volume_sent_callback=volume_sent_cb
+                cancel_flag=None,
+                volume_sent_callback=volume_sent_cb,
+                account_switch_callback=on_account_switch
             )
-            print("\n🎉 全部完成！所有分卷已按批次稳定发送出去。")
-            break # 成功则顺延爬出 while 循环
+            print("\n🎉 全部发送完成。")
+            break
             
         except Exception as e:
-            print(f"\n❌ 致命抛出抛压网络异常或风控：{str(e)}")
+            print(f"\n❌ 发送失败: {str(e)}")
             choice = timed_input(
-                prompt="\n👉 您配置的最高重连数已耗尽，或是遭遇了极其苛刻的安全阻断。\n是否强行再重试一遍发病节点包？[Y 试 / N 删]",
+                prompt="\n是否重试？[Y 重试 / N 退出]",
                 timeout=args.prompt_timeout,
                 default='N'
             )
