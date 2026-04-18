@@ -15,7 +15,6 @@ import os
 # 将当前脚本目录添加到 Python 路径，确保模块导入正常
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app import FileMailerApp
 
 import argparse
 
@@ -44,6 +43,8 @@ def main():
         cli_runner.run_cli(args)
     else:
         # 进入常规 GUI 面板
+        # 延迟导入，防止在纯 CLI/Termux 环境下因缺少 tkinter 库而报错
+        from app import FileMailerApp
         app = FileMailerApp()
         app.run()
 
