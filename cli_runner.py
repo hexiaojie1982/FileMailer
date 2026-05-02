@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -7,10 +8,50 @@ import tempfile
 import shutil
 import traceback
 from typing import List
+from datetime import datetime
 
 import config_manager
 import compressor
 import mailer
+
+
+class TeeLogger:
+    """将 stdout/stderr 同时输出到控制台和日志文件"""
+    def __init__(self, log_path):
+        self.terminal = sys.stdout
+        self.log_file = open(log_path, 'a', encoding='utf-8', buffering=1)
+        
+    def write(self, message):
+        self.terminal.write(message)
+        self.log_file.write(message)
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+        
+    def close(self):
+        self.log_file.close()
+
+
+def setup_logging(file_name: str = None) -> TeeLogger:
+    """设置日志输出，自动保存到 send_logs/ 目录"""
+    logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "send_logs")
+    os.makedirs(logs_dir, exist_ok=True)
+    
+    if file_name:
+        base_name = os.path.splitext(os.path.basename(file_name))[0]
+        log_name = f"{base_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    else:
+        log_name = f"cli_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    log_path = os.path.join(logs_dir, log_name)
+    logger = TeeLogger(log_path)
+    # 保存原始 stdout/stderr，退出时恢复
+    logger._original_stdout = sys.stdout
+    logger._original_stderr = sys.stderr
+    sys.stdout = logger
+    sys.stderr = logger
+    return logger
 
 def timed_input(prompt: str, timeout: int, default: str) -> str:
     """Windows 下带倒计时的按键捕获，倒计时结束默认返回 default"""
@@ -88,6 +129,17 @@ def console_send_progress(msg: str, current: int, total: int):
 
 def run_cli(args: argparse.Namespace):
     """CLI 的核心调度主循环"""
+    # 先确定日志文件名（根据第一个文件命名）
+    logger = None
+    if getattr(args, 'files', None) and len(args.files) > 0:
+        logger = setup_logging(args.files[0])
+    elif args.resume:
+        # 断点续传模式，从 active task 中获取文件名
+        active_task = config_manager.load_active_task()
+        if active_task and active_task.get("volume_paths"):
+            first_vol = active_task["volume_paths"][0]
+            logger = setup_logging(os.path.basename(first_vol))
+    
     print("\n📦 文件分卷压缩 & 邮件发送工具 [CLI 命令行模式]")
     print("=" * 60)
 
@@ -223,6 +275,11 @@ def run_cli(args: argparse.Namespace):
             pass
             
     print("👋 CLI 运行终止。")
+    if logger:
+        # 先恢复原始 stdout/stderr，再关闭 logger，避免 Python 退出清理阶段异常
+        sys.stdout = logger._original_stdout
+        sys.stderr = logger._original_stderr
+        logger.close()
     sys.exit(0)
 
 def main():
@@ -233,6 +290,7 @@ def main():
     parser.add_argument('--volume', type=int, default=20, help='分卷大小(MB)，默认20')
     parser.add_argument('--password', type=str, default='', help='压缩包密码')
     parser.add_argument('--interval', type=int, default=60, help='发送间隔(秒)，默认60')
+    parser.add_argument('--send-limit', type=int, default=0, help='每个账号最大发件数，0=不限制，默认50')
     parser.add_argument('--max-retries', type=int, default=3, help='最大重试次数，默认3')
     parser.add_argument('--retry-wait', type=int, default=15, help='重试等待(秒)，默认15')
     parser.add_argument('--prompt-timeout', type=int, default=5, help='用户提示超时(秒)，默认5')
