@@ -18,6 +18,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 
+
+def _gui_available() -> bool:
+    """检测当前环境是否支持 GUI（tkinter 可创建窗口）"""
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.destroy()
+        return True
+    except Exception:
+        return False
+
+
 def main():
     """程序入口"""
     parser = argparse.ArgumentParser(description="文件分卷压缩 & 邮件自动发送工具")
@@ -37,6 +49,11 @@ def main():
 
     # 仅提取已知参数防止在 GUI 运行双击时带有其他传参引发报错
     args, unknown = parser.parse_known_args()
+
+    # 自动降级：未指定 --cli 但无 GUI 环境时，自动切换到 CLI 模式
+    if not args.cli and not _gui_available():
+        print("⚠️ 当前环境无可用 GUI（无 DISPLAY），自动切换到命令行模式")
+        args.cli = True
 
     if args.cli:
         import cli_runner
