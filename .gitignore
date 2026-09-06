@@ -1,6 +1,21 @@
 send_history.md
 send_logs/
 post_send.sh
+
+# PyInstaller 中间产物；仅发布两个最终 EXE
+/build/
+/*.spec
+/dist/*
+!/dist/FileMailer.exe
+!/dist/FileMailer-CLI.exe
+
+# 本地账户、任务与历史设置（包括人工备份副本）
+accounts*.json
+settings*.json
+active_task*.json
+.secret.key
+
+# Python 缓存与本地构建依赖
 __pycache__/
 *.pyc
-.secret.key
+.tmp_build_deps/

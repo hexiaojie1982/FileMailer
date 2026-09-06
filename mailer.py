@@ -25,6 +25,25 @@ from typing import List, Dict, Optional, Callable
 from config_manager import decrypt_password
 
 
+class PartialRecipientsRefused(smtplib.SMTPException):
+    """邮件仅被部分收件人接受。"""
+
+    def __init__(self, refused_recipients: Dict, requested_recipients: List[str]):
+        self.recipients = refused_recipients
+        refused_keys = {str(address).casefold() for address in refused_recipients}
+        self.refused_recipients = [
+            address for address in requested_recipients
+            if address.casefold() in refused_keys
+        ]
+        self.accepted_recipients = [
+            address for address in requested_recipients
+            if address.casefold() not in refused_keys
+        ]
+        super().__init__(
+            f"部分收件人被服务器拒收: {', '.join(self.refused_recipients)}"
+        )
+
+
 def send_email(
     smtp_config: Dict,
     from_addr: str,
@@ -86,34 +105,39 @@ def send_email(
     port = smtp_config['smtp_port']
     use_ssl = smtp_config.get('use_ssl', True)
 
+    def _login_and_send(smtp) -> None:
+        """登录并确保所有收件人都被服务器接受。"""
+        smtp.login(from_addr, plain_password)
+        refused = smtp.sendmail(from_addr, to_addrs, msg.as_string())
+        # sendmail 在至少一个收件人被接受时不会抛异常，而是返回被拒收者。
+        # 若忽略该返回值，调用方会把分卷错误地标记为全部发送成功。
+        if refused:
+            raise PartialRecipientsRefused(refused, to_addrs)
+
     # 智能判断连接方式：端口 465 使用 SSL 直连，端口 587 使用 STARTTLS
     # 优先根据端口号判断，避免用户配置错误导致连接失败
     if port == 465:
         # SSL 直连（端口 465）
         with smtplib.SMTP_SSL(server, port, timeout=30) as smtp:
-            smtp.login(from_addr, plain_password)
-            smtp.sendmail(from_addr, to_addrs, msg.as_string())
+            _login_and_send(smtp)
     elif port == 587 or not use_ssl:
         # STARTTLS（端口 587 或明确标记为非 SSL）
         with smtplib.SMTP(server, port, timeout=30) as smtp:
             smtp.ehlo()
             smtp.starttls()
             smtp.ehlo()
-            smtp.login(from_addr, plain_password)
-            smtp.sendmail(from_addr, to_addrs, msg.as_string())
+            _login_and_send(smtp)
     else:
         # 其他端口按 use_ssl 标志决定
         if use_ssl:
             with smtplib.SMTP_SSL(server, port, timeout=30) as smtp:
-                smtp.login(from_addr, plain_password)
-                smtp.sendmail(from_addr, to_addrs, msg.as_string())
+                _login_and_send(smtp)
         else:
             with smtplib.SMTP(server, port, timeout=30) as smtp:
                 smtp.ehlo()
                 smtp.starttls()
                 smtp.ehlo()
-                smtp.login(from_addr, plain_password)
-                smtp.sendmail(from_addr, to_addrs, msg.as_string())
+                _login_and_send(smtp)
 
 
 def send_volumes(
@@ -213,7 +237,7 @@ def send_volumes(
         body = (
             f"这是第 {i}/{total} 个分卷文件: {file_name}\n\n"
             f"【重要提示】\n"
-            f"为防止邮件服务器的安全审查拦截拆分压缩包，附件已被自动套上一层常规的 .zip 外壳。\n"
+            f"附件已被自动套上一层常规的 .zip 外壳。\n"
             f"📥 下载本邮件附带的 {zip_file_name} 后，请先直接双击解压它，您会得到真实的 '{file_name}'。\n"
             f"请将所有解压出来的分卷（.001, .002...）放于同一文件夹内，最后使用 7-Zip 打开 .001 即可完整解压全部文件。"
         )
@@ -226,11 +250,25 @@ def send_volumes(
         # 带智能重试与账号自动切换的发送逻辑
         attempt = 0
         tried_accounts = 0  # 已尝试过的账号数（用于判定全部耗尽）
+        pending_to_addrs = list(to_addrs)
         while True:
             try:
-                send_email(smtp_config, from_addr, to_addrs, subject, body, zip_path, zip_file_name)
+                send_email(
+                    smtp_config, from_addr, pending_to_addrs,
+                    subject, body, zip_path, zip_file_name
+                )
                 break  # 成功
             except Exception as e:
+                # 部分收件人已成功时，后续仅重试被拒收者，避免重复投递。
+                if isinstance(e, PartialRecipientsRefused):
+                    pending_to_addrs = e.refused_recipients
+                    if progress_callback:
+                        progress_callback(
+                            f"⚠️ {len(e.accepted_recipients)} 个收件人已接受，"
+                            f"{len(e.refused_recipients)} 个被拒收；仅重试被拒收者。",
+                            i, total
+                        )
+
                 # 认证错误或数据策略错误 → 该账号不可用，直接切换
                 if isinstance(e, (smtplib.SMTPAuthenticationError, smtplib.SMTPDataError)):
                     tried_accounts += 1

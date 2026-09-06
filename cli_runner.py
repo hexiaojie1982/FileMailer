@@ -53,6 +53,25 @@ def setup_logging(file_name: str = None) -> TeeLogger:
     sys.stderr = logger
     return logger
 
+def configure_console_encoding() -> None:
+    """让 Windows CLI 能安全输出中文和 emoji，重定向时也不因编码崩溃。"""
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        except (AttributeError, OSError):
+            pass
+
+    for stream_name in ('stdout', 'stderr'):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except (AttributeError, OSError):
+                pass
+
+
 def timed_input(prompt: str, timeout: int, default: str) -> str:
     """Windows 下带倒计时的按键捕获，倒计时结束默认返回 default"""
     if sys.platform == 'win32':
@@ -129,6 +148,8 @@ def console_send_progress(msg: str, current: int, total: int):
 
 def run_cli(args: argparse.Namespace):
     """CLI 的核心调度主循环"""
+    configure_console_encoding()
+
     # 先确定日志文件名（根据第一个文件命名）
     logger = None
     if getattr(args, 'files', None) and len(args.files) > 0:
@@ -139,7 +160,7 @@ def run_cli(args: argparse.Namespace):
         if active_task and active_task.get("volume_paths"):
             first_vol = active_task["volume_paths"][0]
             logger = setup_logging(os.path.basename(first_vol))
-    
+
     print("\n📦 文件分卷压缩 & 邮件发送工具 [CLI 命令行模式]")
     print("=" * 60)
 
@@ -260,10 +281,12 @@ def run_cli(args: argparse.Namespace):
                 print("\n[交互决议]收到：已充能重跑派信循环！")
                 continue
             else:
-                print("\n[交互决议]默许：已放弃重试准备善后。")
-                break # 退出 while 到达最终清除逻辑
+                print("\n[交互决议]已停止重试。")
+                print("⚠️ 未完成任务的断点和临时分卷均已保留，可使用 --resume 继续发送。")
+                print(f"📂 临时分卷目录: {task_data.get('temp_dir', '')}")
+                sys.exit(2)
 
-    # 凡是运行至此（不管成功发完或是惨遭滑铁卢）一律清库清快照！
+    # 仅在确认全部发送成功后清理快照和临时文件。
     config_manager.clear_active_task()
     temp_dir = task_data.get("temp_dir", "")
     if temp_dir and os.path.exists(temp_dir):
