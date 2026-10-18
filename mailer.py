@@ -12,11 +12,17 @@
     - 密码仅在建立连接时使用，不写入日志
 """
 
+import datetime
+import imaplib
 import os
+import re
 import smtplib
 import time
 import zipfile
+from email import message_from_bytes
+from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
+from email.utils import parsedate_to_datetime
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
@@ -42,6 +48,98 @@ class PartialRecipientsRefused(smtplib.SMTPException):
         super().__init__(
             f"部分收件人被服务器拒收: {', '.join(self.refused_recipients)}"
         )
+
+
+def _decode_mime_header(value):
+    """解码 MIME 编码的邮件头为 unicode 字符串。"""
+    parts = []
+    for text, enc in decode_header(value or ''):
+        if isinstance(text, bytes):
+            parts.append(text.decode(enc or 'utf-8', 'replace'))
+        else:
+            parts.append(text)
+    return ''.join(parts)
+
+
+def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30):
+    """SMTP 超时误判去重：在 IMAP 已发送文件夹中查找近期同主题邮件。
+
+    背景：2026-10-14、2026-10-18 两次事故——SMTP 发送时服务器已收下邮件，
+    但确认回包超时，客户端误判为失败而重试，导致同一邮件重复投递。
+    本函数在每次重试前调用：若已发送文件夹中有同主题邮件，则视为已发送成功。
+
+    仅支持 Gmail（imap.gmail.com）；其他邮箱直接返回 False（保持原重试行为）。
+    任何异常都返回 False（fail-open：绝不因为检查失败而阻止正常重试）。
+    """
+    try:
+        if 'gmail' not in str(smtp_config.get('smtp_server', '')).lower():
+            return False
+        password = decrypt_password(smtp_config['password'])
+        imap = imaplib.IMAP4_SSL('imap.gmail.com', 993)
+        try:
+            imap.login(from_addr, password)
+            sent_box = None
+            try:
+                _typ, boxes = imap.list()
+            except Exception:
+                boxes = []
+            for raw_box in boxes or []:
+                name = (raw_box.decode('utf-8', 'replace')
+                        if isinstance(raw_box, bytes) else str(raw_box))
+                if '\\Sent' in name:
+                    quoted = re.findall(r'"([^"]+)"', name)
+                    if quoted:
+                        sent_box = quoted[-1]
+                        break
+            if not sent_box:
+                for cand in ('[Gmail]/Sent Mail', 'Sent'):
+                    try:
+                        typ, _ = imap.select('"%s"' % cand, readonly=True)
+                    except Exception:
+                        typ = 'NO'
+                    if typ == 'OK':
+                        sent_box = cand
+                        break
+            if not sent_box:
+                return False
+            # select() 不会自动引用含空格的文件夹名，必须手动加双引号
+            imap.select('"%s"' % sent_box.replace('"', ''), readonly=True)
+            today = datetime.datetime.now().strftime('%d-%b-%Y')
+            typ, data = imap.uid('search', None, 'SINCE', today)
+            if typ != 'OK' or not data or not data[0].strip():
+                return False
+            cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                      - datetime.timedelta(minutes=window_minutes))
+            for uid in data[0].split():
+                try:
+                    ftyp, fdata = imap.uid(
+                        'fetch', uid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])')
+                except Exception:
+                    continue
+                if ftyp != 'OK' or not fdata or not fdata[0]:
+                    continue
+                raw = fdata[0][1] if isinstance(fdata[0], tuple) else b''
+                msg = message_from_bytes(raw)
+                if _decode_mime_header(msg.get('Subject', '')) != subject:
+                    continue
+                try:
+                    sent_dt = parsedate_to_datetime(msg.get('Date', ''))
+                except Exception:
+                    sent_dt = None
+                if sent_dt is None:
+                    return True  # 主题命中但日期无法解析：宁可视为已发送，避免重发
+                if sent_dt.tzinfo is None:
+                    sent_dt = sent_dt.replace(tzinfo=datetime.timezone.utc)
+                if sent_dt >= cutoff:
+                    return True
+            return False
+        finally:
+            try:
+                imap.logout()
+            except Exception:
+                pass
+    except Exception:
+        return False
 
 
 def send_email(
@@ -252,6 +350,15 @@ def send_volumes(
         tried_accounts = 0  # 已尝试过的账号数（用于判定全部耗尽）
         pending_to_addrs = list(to_addrs)
         while True:
+            # 从第 2 次尝试起：SMTP 超时/断连可能是"服务器已收下、确认回包丢失"的误判
+            # （2026-10-14、2026-10-18 两次重复投递事故），先查 IMAP 已发送文件夹，
+            # 命中同主题则视为已发送成功，跳过重试。
+            if attempt > 0 and _imap_sent_has_subject(smtp_config, from_addr, subject):
+                if progress_callback:
+                    progress_callback(
+                        "✅ IMAP 已发送中找到同主题邮件，判定已发送成功，跳过重试。",
+                        i, total)
+                break
             try:
                 send_email(
                     smtp_config, from_addr, pending_to_addrs,

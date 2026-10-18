@@ -159,5 +159,140 @@ class CliP0Tests(unittest.TestCase):
         remove_temp.assert_not_called()
 
 
+class _FakeIMAP:
+    """imaplib.IMAP4_SSL 的替身：模拟已发送文件夹内容。"""
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        _FakeIMAP.instances.append(self)
+        self.logged_in = None
+        self.selected = None
+        self.list_result = ('OK', [b'(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"'])
+        self.search_uids = b'1'
+        self.fetch_headers = {}
+
+    def login(self, user, password):
+        self.logged_in = (user, password)
+
+    def list(self):
+        if isinstance(self.list_result, Exception):
+            raise self.list_result
+        return self.list_result
+
+    def select(self, box, readonly=False):
+        self.selected = box
+        return ('OK', [b'1'])
+
+    def uid(self, cmd, *args):
+        if cmd == 'search':
+            return ('OK', [self.search_uids])
+        if cmd == 'fetch':
+            uid = args[0]
+            key = uid if isinstance(uid, bytes) else str(uid).encode()
+            raw = self.fetch_headers.get(
+                key, b'Subject: unrelated\r\nDate: Thu, 01 Jan 1970 00:00:00 +0000\r\n\r\n')
+            return ('OK', [(b'1 (BODY[HEADER.FIELDS (SUBJECT DATE)] {%d})' % len(raw), raw)])
+        raise AssertionError(cmd)
+
+    def logout(self):
+        pass
+
+
+def _recent_date_header():
+    import datetime
+    from email.utils import format_datetime
+    return format_datetime(datetime.datetime.now(datetime.timezone.utc))
+
+
+class MailerImapDedupTests(unittest.TestCase):
+    def setUp(self):
+        _FakeIMAP.instances.clear()
+
+    def _gmail_config(self):
+        return {
+            "smtp_server": "smtp.gmail.com",
+            "smtp_port": 587,
+            "password": "encrypted",
+            "use_ssl": False,
+        }
+
+    def test_imap_hit_within_window_returns_true(self):
+        imap = _FakeIMAP()
+        imap.fetch_headers = {
+            b'1': ('Subject: lumen-0.3.80 [1/1]\r\nDate: %s\r\n\r\n'
+                   % _recent_date_header()).encode('utf-8'),
+        }
+        with mock.patch.object(mailer, "decrypt_password", return_value="secret"), \
+             mock.patch.object(mailer.imaplib, "IMAP4_SSL", return_value=imap):
+            hit = mailer._imap_sent_has_subject(
+                self._gmail_config(), "sender@gmail.com", "lumen-0.3.80 [1/1]")
+        self.assertTrue(hit)
+        self.assertEqual(imap.logged_in[0], "sender@gmail.com")
+        self.assertEqual(imap.selected, '"[Gmail]/Sent Mail"')
+
+    def test_imap_miss_returns_false(self):
+        imap = _FakeIMAP()  # 默认 fetch 返回不相关主题
+        with mock.patch.object(mailer, "decrypt_password", return_value="secret"), \
+             mock.patch.object(mailer.imaplib, "IMAP4_SSL", return_value=imap):
+            hit = mailer._imap_sent_has_subject(
+                self._gmail_config(), "sender@gmail.com", "lumen-0.3.80 [1/1]")
+        self.assertFalse(hit)
+
+    def test_imap_error_is_fail_open(self):
+        imap = _FakeIMAP()
+        imap.list_result = OSError("imap unreachable")
+        with mock.patch.object(mailer, "decrypt_password", return_value="secret"), \
+             mock.patch.object(mailer.imaplib, "IMAP4_SSL", return_value=imap):
+            hit = mailer._imap_sent_has_subject(
+                self._gmail_config(), "sender@gmail.com", "lumen-0.3.80 [1/1]")
+        self.assertFalse(hit)
+
+    def test_non_gmail_skips_imap(self):
+        config = dict(self._gmail_config(), smtp_server="smtp.example.com")
+        with mock.patch.object(mailer.imaplib, "IMAP4_SSL") as imap_cls:
+            hit = mailer._imap_sent_has_subject(
+                config, "sender@example.com", "subject")
+        self.assertFalse(hit)
+        imap_cls.assert_not_called()
+
+    def test_send_volumes_skips_retry_when_imap_hit(self):
+        calls = []
+
+        def fake_send_email(
+            smtp_config, from_addr, to_addrs, subject, body,
+            attachment_path=None, attachment_name=None,
+        ):
+            calls.append(subject)
+            raise TimeoutError("read timed out")  # 服务器已收下但回包超时
+
+        sent = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            volume_path = os.path.join(temp_dir, "archive.7z.001")
+            with open(volume_path, "wb") as volume:
+                volume.write(b"test volume")
+
+            with mock.patch.object(mailer, "send_email", side_effect=fake_send_email), \
+                 mock.patch.object(mailer, "_imap_sent_has_subject", return_value=True), \
+                 mock.patch.object(mailer.time, "sleep"):
+                mailer.send_volumes(
+                    sender_accounts=[{
+                        "smtp_config": self._gmail_config(),
+                        "from_addr": "sender@gmail.com",
+                    }],
+                    to_addrs=["recipient@example.com"],
+                    subject_prefix="archive",
+                    volume_paths=[volume_path],
+                    interval_seconds=0,
+                    max_retries=3,
+                    retry_wait=0,
+                    volume_sent_callback=lambda i, p: sent.append(i),
+                )
+
+        # 只尝试发送一次：第二次尝试前 IMAP 命中，直接视为成功，不再重发
+        self.assertEqual(calls, ["archive [1/1]"])
+        self.assertEqual(sent, [1])
+
+
 if __name__ == "__main__":
     unittest.main()
