@@ -73,7 +73,7 @@ class MailerP0Tests(unittest.TestCase):
 
         def fake_send_email(
             smtp_config, from_addr, to_addrs, subject, body,
-            attachment_path=None, attachment_name=None,
+            attachment_path=None, attachment_name=None, message_id=None,
         ):
             calls.append(list(to_addrs))
             if len(calls) == 1:
@@ -261,7 +261,7 @@ class MailerImapDedupTests(unittest.TestCase):
 
         def fake_send_email(
             smtp_config, from_addr, to_addrs, subject, body,
-            attachment_path=None, attachment_name=None,
+            attachment_path=None, attachment_name=None, message_id=None,
         ):
             calls.append(subject)
             raise TimeoutError("read timed out")  # 服务器已收下但回包超时

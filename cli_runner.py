@@ -207,14 +207,19 @@ def run_cli(args: argparse.Namespace):
         print("\n⚙️ 阶段 1：正在压缩分卷...")
         temp_dir = tempfile.mkdtemp(prefix="file_mailer_cli_")
         
-        volume_paths = compressor.compress_and_split(
-            source_paths=args.files,
-            output_dir=temp_dir,
-            archive_name=archive_name,
-            password=args.password,
-            volume_size_mb=args.volume,
-            progress_callback=console_compress_progress
-        )
+        try:
+            volume_paths = compressor.compress_and_split(
+                source_paths=args.files,
+                output_dir=temp_dir,
+                archive_name=archive_name,
+                password=args.password,
+                volume_size_mb=args.volume,
+                progress_callback=console_compress_progress
+            )
+        except ValueError as e:
+            # 如空密码被拦截（安全审计 B2）：给出明确原因，不留堆栈
+            print(f"❌ {e}")
+            sys.exit(1)
         print(f"✅ 压缩完成，共 {len(volume_paths)} 份分卷。")
         
         task_data = {

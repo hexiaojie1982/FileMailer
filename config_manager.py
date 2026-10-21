@@ -28,9 +28,28 @@ else:
     # 正常 Python 源码运行环境
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _ACCOUNTS_FILE = os.path.join(_BASE_DIR, "accounts.json")
-_SECRET_KEY_FILE = os.path.join(_BASE_DIR, ".secret.key")
+_LEGACY_SECRET_KEY_FILE = os.path.join(_BASE_DIR, ".secret.key")
 _SETTINGS_FILE = os.path.join(_BASE_DIR, "settings.json")
 _ACTIVE_TASK_FILE = os.path.join(_BASE_DIR, "active_task.json")
+
+def _user_key_dir() -> str:
+    """每用户密钥目录：与程序/项目目录分离存放（安全审计 A1）。
+
+    密钥不再与密文 accounts.json 同目录，避免"读到项目目录即可全量解密"。
+    Windows: %LOCALAPPDATA%\\FileMailer；POSIX: $XDG_CONFIG_HOME/filemailer
+    或 ~/.config/filemailer。
+    """
+    if sys.platform == "win32":
+        base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+                or os.path.expanduser("~"))
+        return os.path.join(base, "FileMailer")
+    base = (os.environ.get("XDG_CONFIG_HOME")
+            or os.path.join(os.path.expanduser("~"), ".config"))
+    return os.path.join(base, "filemailer")
+
+
+_SECRET_KEY_FILE = os.path.join(_user_key_dir(), "secret.key")
+
 
 # 预设的常见邮箱 SMTP 配置
 SMTP_PRESETS = {
@@ -67,12 +86,33 @@ SMTP_PRESETS = {
 }
 
 
+def _write_key_file(path: str, key: bytes) -> None:
+    """写入密钥文件，并尽量收紧权限（目录 0700 / 文件 0600，POSIX）。"""
+    key_dir = os.path.dirname(path)
+    if key_dir:
+        os.makedirs(key_dir, exist_ok=True)
+        if os.name == "posix":
+            try:
+                os.chmod(key_dir, 0o700)
+            except OSError:
+                pass
+    with open(path, 'wb') as f:
+        f.write(key)
+    if os.name == "posix":
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
 def _get_or_create_key() -> bytes:
     """
     获取或创建 Fernet 加密密钥。
 
-    首次调用时自动生成密钥并保存到 .secret.key 文件。
-    后续调用直接从文件读取。
+    密钥存放在每用户目录（见 _user_key_dir），与 accounts.json 分离。
+    若旧位置（程序目录 .secret.key）存在密钥，首次调用时迁移：
+    写入新位置 → 读回逐字节校验 → 校验通过才删除旧文件；
+    迁移任何一步失败都继续使用旧密钥，绝不中断解密。
 
     Returns:
         Fernet 密钥字节串
@@ -80,12 +120,21 @@ def _get_or_create_key() -> bytes:
     if os.path.exists(_SECRET_KEY_FILE):
         with open(_SECRET_KEY_FILE, 'rb') as f:
             return f.read()
-    else:
-        # 生成新的 Fernet 密钥
-        key = Fernet.generate_key()
-        with open(_SECRET_KEY_FILE, 'wb') as f:
-            f.write(key)
+    if os.path.exists(_LEGACY_SECRET_KEY_FILE):
+        with open(_LEGACY_SECRET_KEY_FILE, 'rb') as f:
+            key = f.read()
+        try:
+            _write_key_file(_SECRET_KEY_FILE, key)
+            with open(_SECRET_KEY_FILE, 'rb') as f:
+                if f.read() != key:
+                    raise IOError("密钥迁移读回校验失败")
+            os.remove(_LEGACY_SECRET_KEY_FILE)
+        except OSError:
+            pass  # 迁移失败：继续使用旧位置密钥，下次调用再试
         return key
+    key = Fernet.generate_key()
+    _write_key_file(_SECRET_KEY_FILE, key)
+    return key
 
 
 def _get_fernet() -> Fernet:

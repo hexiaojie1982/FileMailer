@@ -17,11 +17,25 @@ import py7zr
 from typing import List, Callable, Optional
 
 
+def _require_password(password: Optional[str], allow_unencrypted: bool) -> None:
+    """空密码拦截（安全审计 B2）：未显式允许时，拒绝生成未加密归档。
+
+    历史上 password 为空会静默关闭内容与文件名加密，漏传一次参数即明文外发。
+    确需明文时由调用方在代码层显式传入 allow_unencrypted=True。
+    """
+    if not password and not allow_unencrypted:
+        raise ValueError(
+            "未提供压缩密码：为防止明文外发，已拒绝生成未加密归档。"
+            "如确需不加密，请显式传入 allow_unencrypted=True。"
+        )
+
+
 def compress_to_7z(
     source_paths: List[str],
     output_path: str,
     password: Optional[str] = None,
-    progress_callback: Optional[Callable[[str], None]] = None
+    progress_callback: Optional[Callable[[str], None]] = None,
+    allow_unencrypted: bool = False
 ) -> str:
     """
     将文件/文件夹列表压缩为单个 7z 文件。
@@ -29,12 +43,14 @@ def compress_to_7z(
     Args:
         source_paths: 要压缩的文件/文件夹路径列表
         output_path: 输出的 .7z 文件完整路径
-        password: 解压密码（可选，为 None 则不加密）
+        password: 解压密码（为空且未显式 allow_unencrypted 时抛 ValueError）
         progress_callback: 进度回调函数，接收状态字符串
+        allow_unencrypted: 显式允许生成未加密归档（默认 False）
 
     Returns:
         生成的 .7z 文件路径
     """
+    _require_password(password, allow_unencrypted)
     if progress_callback:
         progress_callback("正在压缩文件...")
 
@@ -134,7 +150,8 @@ def compress_and_split(
     archive_name: str,
     password: Optional[str] = None,
     volume_size_mb: int = 10,
-    progress_callback: Optional[Callable[[str, float], None]] = None
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+    allow_unencrypted: bool = False
 ) -> List[str]:
     """
     完整的压缩 + 分卷流程。
@@ -143,13 +160,15 @@ def compress_and_split(
         source_paths: 要压缩的文件/文件夹路径列表
         output_dir: 输出目录
         archive_name: 压缩包基础名称（不含扩展名）
-        password: 解压密码（可选）
+        password: 解压密码（为空且未显式 allow_unencrypted 时抛 ValueError）
         volume_size_mb: 分卷大小（MB）
         progress_callback: 进度回调 (状态字符串, 进度百分比 0-100)
+        allow_unencrypted: 显式允许生成未加密归档（默认 False）
 
     Returns:
         分卷文件路径列表（按顺序）
     """
+    _require_password(password, allow_unencrypted)
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
 
@@ -164,7 +183,8 @@ def compress_and_split(
         if progress_callback:
             progress_callback(msg, -1)  # -1 表示不确定进度
 
-    compress_to_7z(source_paths, archive_path, password, compress_cb)
+    compress_to_7z(source_paths, archive_path, password, compress_cb,
+                    allow_unencrypted=allow_unencrypted)
 
     # 第二步：分卷切割
     if progress_callback:

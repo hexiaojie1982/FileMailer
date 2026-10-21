@@ -1020,6 +1020,10 @@ class FileMailerApp:
             messagebox.showwarning("提示", "请至少添加一个收件人")
             return False
 
+        if not self.compress_pwd_var.get():
+            messagebox.showwarning("提示", "请设置压缩密码（不允许生成未加密压缩包）")
+            return False
+
         try:
             vol_size = int(self.volume_var.get())
             if vol_size <= 0:

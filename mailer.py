@@ -22,7 +22,7 @@ import zipfile
 from email import message_from_bytes
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
-from email.utils import parsedate_to_datetime
+from email.utils import parsedate_to_datetime, make_msgid
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
@@ -61,12 +61,19 @@ def _decode_mime_header(value):
     return ''.join(parts)
 
 
-def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30):
-    """SMTP 超时误判去重：在 IMAP 已发送文件夹中查找近期同主题邮件。
+def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30,
+                           message_id=None):
+    """SMTP 超时误判去重：在 IMAP 已发送文件夹中查找本卷邮件。
 
     背景：2026-10-14、2026-10-18 两次事故——SMTP 发送时服务器已收下邮件，
     但确认回包超时，客户端误判为失败而重试，导致同一邮件重复投递。
-    本函数在每次重试前调用：若已发送文件夹中有同主题邮件，则视为已发送成功。
+    本函数在每次重试前调用：命中则视为已发送成功。
+
+    绑定方式（安全审计 A2）：传入 message_id 时按 Message-ID 精确匹配，
+    只认本卷本次提交的那一封；未传时回退到"主题+时间窗"匹配（旧行为）。
+    仅凭主题匹配曾导致误判：部分收件人被拒收后，已发送箱里的部分成功
+    邮件会被误认作"全部送达"，故 send_volumes 在发生过部分拒收后不再
+    使用本检查短路（见 send_volumes 的 partial_refusal_seen）。
 
     仅支持 Gmail（imap.gmail.com）；其他邮箱直接返回 False（保持原重试行为）。
     任何异常都返回 False（fail-open：绝不因为检查失败而阻止正常重试）。
@@ -113,13 +120,20 @@ def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30):
             for uid in data[0].split():
                 try:
                     ftyp, fdata = imap.uid(
-                        'fetch', uid, '(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])')
+                        'fetch', uid,
+                        '(BODY.PEEK[HEADER.FIELDS (SUBJECT DATE MESSAGE-ID)])')
                 except Exception:
                     continue
                 if ftyp != 'OK' or not fdata or not fdata[0]:
                     continue
                 raw = fdata[0][1] if isinstance(fdata[0], tuple) else b''
                 msg = message_from_bytes(raw)
+                if message_id:
+                    # 精确绑定：Message-ID 与本卷提交时设置的完全一致才算命中
+                    found_mid = (msg.get('Message-ID', '') or '').strip()
+                    if found_mid != message_id.strip():
+                        continue
+                    return True
                 if _decode_mime_header(msg.get('Subject', '')) != subject:
                     continue
                 try:
@@ -149,7 +163,8 @@ def send_email(
     subject: str,
     body: str,
     attachment_path: Optional[str] = None,
-    attachment_name: Optional[str] = None
+    attachment_name: Optional[str] = None,
+    message_id: Optional[str] = None
 ) -> None:
     """
     发送一封带附件的邮件。
@@ -175,6 +190,9 @@ def send_email(
     msg['From'] = from_addr
     msg['To'] = "; ".join(to_addrs)  # 多个收件人用分号分隔
     msg['Subject'] = subject
+    if message_id:
+        # 本卷唯一 ID：供重试前的 IMAP 去重精确绑定本封邮件（安全审计 A2）
+        msg['Message-ID'] = message_id
 
     # 添加邮件正文
     msg.attach(MIMEText(body, 'plain', 'utf-8'))
@@ -349,11 +367,19 @@ def send_volumes(
         attempt = 0
         tried_accounts = 0  # 已尝试过的账号数（用于判定全部耗尽）
         pending_to_addrs = list(to_addrs)
+        # 本卷唯一 Message-ID：同卷所有重试共用，IMAP 去重按它精确绑定（A2）
+        volume_message_id = make_msgid(idstring=f"fm{i}")
+        # 发生过部分拒收后，已发送箱里的邮件只证明部分收件人已送达，
+        # 不能据此判定整卷完成 → 关闭 IMAP 短路，靠定向重试被拒者（A2）
+        partial_refusal_seen = False
         while True:
             # 从第 2 次尝试起：SMTP 超时/断连可能是"服务器已收下、确认回包丢失"的误判
             # （2026-10-14、2026-10-18 两次重复投递事故），先查 IMAP 已发送文件夹，
-            # 命中同主题则视为已发送成功，跳过重试。
-            if attempt > 0 and _imap_sent_has_subject(smtp_config, from_addr, subject):
+            # 按 Message-ID 命中本卷邮件则视为已发送成功，跳过重试。
+            if (attempt > 0 and not partial_refusal_seen
+                    and _imap_sent_has_subject(
+                        smtp_config, from_addr, subject,
+                        message_id=volume_message_id)):
                 if progress_callback:
                     progress_callback(
                         "✅ IMAP 已发送中找到同主题邮件，判定已发送成功，跳过重试。",
@@ -362,12 +388,14 @@ def send_volumes(
             try:
                 send_email(
                     smtp_config, from_addr, pending_to_addrs,
-                    subject, body, zip_path, zip_file_name
+                    subject, body, zip_path, zip_file_name,
+                    message_id=volume_message_id
                 )
                 break  # 成功
             except Exception as e:
                 # 部分收件人已成功时，后续仅重试被拒收者，避免重复投递。
                 if isinstance(e, PartialRecipientsRefused):
+                    partial_refusal_seen = True
                     pending_to_addrs = e.refused_recipients
                     if progress_callback:
                         progress_callback(
