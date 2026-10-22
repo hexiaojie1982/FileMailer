@@ -69,8 +69,12 @@ def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30,
     但确认回包超时，客户端误判为失败而重试，导致同一邮件重复投递。
     本函数在每次重试前调用：命中则视为已发送成功。
 
-    绑定方式（安全审计 A2）：传入 message_id 时按 Message-ID 精确匹配，
-    只认本卷本次提交的那一封；未传时回退到"主题+时间窗"匹配（旧行为）。
+    绑定方式（安全审计 A2 + 2026-10-22 组合判定）：传入 message_id 时
+    先按 Message-ID 精确匹配；精确未命中时再用"主题一致 + 时间戳在窗口内"
+    的组合判定兜底——因为 Gmail 可能改写客户端提交的 Message-ID，
+    只认 ID 会让核验静默失效、重复发送照常发生。组合判定必须同时满足
+    主题与时间窗，不退回"只看主题"。未传 message_id 时保持旧行为
+    （主题+时间窗，日期不可解析时视为命中）。
     仅凭主题匹配曾导致误判：部分收件人被拒收后，已发送箱里的部分成功
     邮件会被误认作"全部送达"，故 send_volumes 在发生过部分拒收后不再
     使用本检查短路（见 send_volumes 的 partial_refusal_seen）。
@@ -117,6 +121,7 @@ def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30,
                 return False
             cutoff = (datetime.datetime.now(datetime.timezone.utc)
                       - datetime.timedelta(minutes=window_minutes))
+            candidates = []
             for uid in data[0].split():
                 try:
                     ftyp, fdata = imap.uid(
@@ -127,24 +132,43 @@ def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30,
                 if ftyp != 'OK' or not fdata or not fdata[0]:
                     continue
                 raw = fdata[0][1] if isinstance(fdata[0], tuple) else b''
-                msg = message_from_bytes(raw)
-                if message_id:
-                    # 精确绑定：Message-ID 与本卷提交时设置的完全一致才算命中
-                    found_mid = (msg.get('Message-ID', '') or '').strip()
-                    if found_mid != message_id.strip():
-                        continue
-                    return True
-                if _decode_mime_header(msg.get('Subject', '')) != subject:
-                    continue
+                candidates.append(message_from_bytes(raw))
+
+            def _in_window(msg):
+                """候选邮件的时间戳是否落在窗口内；日期不可解析返回 None。"""
                 try:
                     sent_dt = parsedate_to_datetime(msg.get('Date', ''))
                 except Exception:
                     sent_dt = None
                 if sent_dt is None:
-                    return True  # 主题命中但日期无法解析：宁可视为已发送，避免重发
+                    return None
                 if sent_dt.tzinfo is None:
                     sent_dt = sent_dt.replace(tzinfo=datetime.timezone.utc)
-                if sent_dt >= cutoff:
+                return sent_dt >= cutoff
+
+            if message_id:
+                # 第一级：Message-ID 精确绑定，只认本卷本次提交的那一封
+                for msg in candidates:
+                    found_mid = (msg.get('Message-ID', '') or '').strip()
+                    if found_mid == message_id.strip():
+                        return True
+                # 第二级：主题 + 时间戳组合判定。Gmail 可能改写客户端
+                # 提交的 Message-ID，只认 ID 会让核验静默失效；组合判定
+                # 要求日期可解析且在窗口内，不退回"只看主题"。
+                for msg in candidates:
+                    if _decode_mime_header(msg.get('Subject', '')) != subject:
+                        continue
+                    if _in_window(msg) is True:
+                        return True
+                return False
+
+            # 未传 message_id 的旧行为：主题+时间窗，
+            # 日期无法解析时宁可视为已发送，避免重发。
+            for msg in candidates:
+                if _decode_mime_header(msg.get('Subject', '')) != subject:
+                    continue
+                in_window = _in_window(msg)
+                if in_window is None or in_window:
                     return True
             return False
         finally:
@@ -375,7 +399,8 @@ def send_volumes(
         while True:
             # 从第 2 次尝试起：SMTP 超时/断连可能是"服务器已收下、确认回包丢失"的误判
             # （2026-10-14、2026-10-18 两次重复投递事故），先查 IMAP 已发送文件夹，
-            # 按 Message-ID 命中本卷邮件则视为已发送成功，跳过重试。
+            # 按 Message-ID 精确命中、或主题+时间戳组合命中本卷邮件，
+            # 则视为已发送成功，跳过重试。
             if (attempt > 0 and not partial_refusal_seen
                     and _imap_sent_has_subject(
                         smtp_config, from_addr, subject,
