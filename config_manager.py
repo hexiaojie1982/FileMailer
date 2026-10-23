@@ -16,8 +16,17 @@
 import os
 import sys
 import json
+import tempfile
+from datetime import datetime
 from typing import List, Dict, Optional
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+
+
+class PasswordDecryptError(RuntimeError):
+    """账号密文/密钥不匹配或自愈失败，不能作为网络故障重试。"""
+
+    def __init__(self, message="账号密码解密失败（密钥不匹配）；已停止发送，这不是网络问题。"):
+        super().__init__(message)
 
 
 # 常量：配置文件和密钥文件的默认路径（与脚本或exe同目录）
@@ -111,7 +120,7 @@ def _get_or_create_key() -> bytes:
 
     密钥存放在每用户目录（见 _user_key_dir），与 accounts.json 分离。
     若旧位置（程序目录 .secret.key）存在密钥，首次调用时迁移：
-    写入新位置 → 读回逐字节校验 → 校验通过才删除旧文件；
+    写入新位置 → 读回逐字节校验；保留旧文件供其他运行副本自愈；
     迁移任何一步失败都继续使用旧密钥，绝不中断解密。
 
     Returns:
@@ -128,7 +137,6 @@ def _get_or_create_key() -> bytes:
             with open(_SECRET_KEY_FILE, 'rb') as f:
                 if f.read() != key:
                     raise IOError("密钥迁移读回校验失败")
-            os.remove(_LEGACY_SECRET_KEY_FILE)
         except OSError:
             pass  # 迁移失败：继续使用旧位置密钥，下次调用再试
         return key
@@ -168,9 +176,99 @@ def decrypt_password(encrypted_password: str) -> str:
     Returns:
         解密后的明文密码
     """
-    fernet = _get_fernet()
-    decrypted = fernet.decrypt(encrypted_password.encode('utf-8'))
-    return decrypted.decode('utf-8')
+    try:
+        key = _get_or_create_key()
+        fernet = Fernet(key)
+        token = encrypted_password.encode('utf-8')
+        try:
+            return fernet.decrypt(token).decode('utf-8')
+        except InvalidToken:
+            if not os.path.exists(_LEGACY_SECRET_KEY_FILE):
+                raise PasswordDecryptError()
+            with open(_LEGACY_SECRET_KEY_FILE, 'rb') as f:
+                legacy_key = f.read()
+            if legacy_key == key:
+                raise PasswordDecryptError()
+            legacy = Fernet(legacy_key)
+            plain = legacy.decrypt(token).decode('utf-8')
+            _selfheal_accounts(fernet, legacy)
+            return plain
+    except PasswordDecryptError:
+        raise
+    except (InvalidToken, OSError, ValueError, TypeError, AttributeError) as exc:
+        raise PasswordDecryptError() from exc
+
+
+def _selfheal_accounts(current: Fernet, legacy: Fernet) -> None:
+    """只迁移当前账号文件；备份原字节，临时文件读回复验后原子替换。
+
+    已迁移的文件不会再次改写，兼容发送池仍持有旧密文的情况。
+    任一账号无法用这两个密钥解开时，保持原文件不变并明确失败。
+    """
+    staged_path = None
+    try:
+        with open(_ACCOUNTS_FILE, 'rb') as f:
+            original = f.read()
+        data = json.loads(original)
+        expected_passwords = []
+        changed = False
+        for account in data['accounts']:
+            token = account['password'].encode('utf-8')
+            try:
+                plain = legacy.decrypt(token)
+            except InvalidToken:
+                plain = current.decrypt(token)
+            else:
+                account['password'] = current.encrypt(plain).decode('utf-8')
+                changed = True
+            expected_passwords.append(plain)
+        if not changed:
+            return
+
+        directory = os.path.dirname(os.path.abspath(_ACCOUNTS_FILE))
+        backup_base = os.path.join(
+            directory, 'accounts.before-selfheal-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+        # 同一秒发生多次迁移也不能覆盖已有备份。
+        sequence = 0
+        while True:
+            suffix = '' if sequence == 0 else f'-{sequence}'
+            try:
+                with open(backup_base + suffix + '.json', 'xb') as f:
+                    f.write(original)
+                break
+            except FileExistsError:
+                sequence += 1
+
+        with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8', dir=directory,
+                prefix='.accounts-selfheal-', suffix='.tmp', delete=False) as f:
+            staged_path = f.name
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        with open(staged_path, 'r', encoding='utf-8') as f:
+            verified = json.load(f)
+        verified_passwords = [
+            current.decrypt(account['password'].encode('utf-8'))
+            for account in verified['accounts']
+        ]
+        if verified_passwords != expected_passwords or verified != data:
+            raise ValueError('账号迁移读回复验失败')
+        with open(_ACCOUNTS_FILE, 'rb') as f:
+            if f.read() != original:
+                raise ValueError('账号文件已变更，停止覆盖')
+        os.replace(staged_path, _ACCOUNTS_FILE)
+        staged_path = None
+    except Exception as exc:
+        raise PasswordDecryptError(
+            '账号密码解密失败（密钥不匹配）；自愈迁移失败，原账号文件未被覆盖。'
+            '已停止发送，这不是网络问题。') from exc
+    finally:
+        if staged_path is not None:
+            try:
+                os.remove(staged_path)
+            except OSError:
+                pass
 
 
 def load_accounts() -> List[Dict]:

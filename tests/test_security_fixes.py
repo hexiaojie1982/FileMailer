@@ -25,8 +25,10 @@ class KeyIsolationTests(unittest.TestCase):
         base = self._tmp.name
         self.new_key = os.path.join(base, "userdir", "secret.key")
         self.legacy_key = os.path.join(base, "progdir", ".secret.key")
+        self.accounts_file = os.path.join(base, "progdir", "accounts.json")
         os.makedirs(os.path.dirname(self.legacy_key))
         self._patchers = [
+            mock.patch.object(config_manager, "_ACCOUNTS_FILE", self.accounts_file),
             mock.patch.object(config_manager, "_SECRET_KEY_FILE", self.new_key),
             mock.patch.object(
                 config_manager, "_LEGACY_SECRET_KEY_FILE", self.legacy_key),
@@ -51,7 +53,7 @@ class KeyIsolationTests(unittest.TestCase):
         self.assertEqual(
             config_manager.decrypt_password(cipher), "mailbox-password")
         self.assertTrue(os.path.exists(self.new_key))
-        self.assertFalse(os.path.exists(self.legacy_key))
+        self.assertTrue(os.path.exists(self.legacy_key))
         with open(self.new_key, "rb") as f:
             self.assertEqual(f.read(), key)
         if os.name == "posix":

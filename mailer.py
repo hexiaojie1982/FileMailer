@@ -28,7 +28,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 from typing import List, Dict, Optional, Callable
 
-from config_manager import decrypt_password
+from config_manager import decrypt_password, PasswordDecryptError
 
 
 class PartialRecipientsRefused(smtplib.SMTPException):
@@ -80,7 +80,7 @@ def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30,
     使用本检查短路（见 send_volumes 的 partial_refusal_seen）。
 
     仅支持 Gmail（imap.gmail.com）；其他邮箱直接返回 False（保持原重试行为）。
-    任何异常都返回 False（fail-open：绝不因为检查失败而阻止正常重试）。
+    密码解密失败向上抛出；其他异常返回 False（fail-open）。
     """
     try:
         if 'gmail' not in str(smtp_config.get('smtp_server', '')).lower():
@@ -176,6 +176,8 @@ def _imap_sent_has_subject(smtp_config, from_addr, subject, window_minutes=30,
                 imap.logout()
             except Exception:
                 pass
+    except PasswordDecryptError:
+        raise
     except Exception:
         return False
 
@@ -401,22 +403,28 @@ def send_volumes(
             # （2026-10-14、2026-10-18 两次重复投递事故），先查 IMAP 已发送文件夹，
             # 按 Message-ID 精确命中、或主题+时间戳组合命中本卷邮件，
             # 则视为已发送成功，跳过重试。
-            if (attempt > 0 and not partial_refusal_seen
-                    and _imap_sent_has_subject(
-                        smtp_config, from_addr, subject,
-                        message_id=volume_message_id)):
-                if progress_callback:
-                    progress_callback(
-                        "✅ IMAP 已发送中找到同主题邮件，判定已发送成功，跳过重试。",
-                        i, total)
-                break
             try:
+                if (attempt > 0 and not partial_refusal_seen
+                        and _imap_sent_has_subject(
+                            smtp_config, from_addr, subject,
+                            message_id=volume_message_id)):
+                    if progress_callback:
+                        progress_callback(
+                            "✅ IMAP 已发送中找到同主题邮件，判定已发送成功，跳过重试。",
+                            i, total)
+                    break
                 send_email(
                     smtp_config, from_addr, pending_to_addrs,
                     subject, body, zip_path, zip_file_name,
                     message_id=volume_message_id
                 )
                 break  # 成功
+            except PasswordDecryptError:
+                if progress_callback:
+                    progress_callback(
+                        "⛔ 账号密码解密失败（密钥不匹配），已停止发送；这不是网络问题。",
+                        i, total)
+                raise
             except Exception as e:
                 # 部分收件人已成功时，后续仅重试被拒收者，避免重复投递。
                 if isinstance(e, PartialRecipientsRefused):

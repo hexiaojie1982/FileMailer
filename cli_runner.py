@@ -275,6 +275,10 @@ def run_cli(args: argparse.Namespace):
             print("\n🎉 全部发送完成。")
             break
             
+        except config_manager.PasswordDecryptError as e:
+            print(f"\n❌ 发送失败: {e}")
+            print("⚠️ 已停止发送，请修复账号密钥配置后再继续；未完成任务和临时分卷已保留。")
+            sys.exit(2)
         except Exception as e:
             print(f"\n❌ 发送失败: {str(e)}")
             choice = timed_input(
